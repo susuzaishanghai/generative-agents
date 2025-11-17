@@ -97,6 +97,21 @@
 - `(persona_name, type)` 普通索引（便于按角色 + 类型过滤）
 - 如果要支持 `retrieve()` 的关键词检索，可对 `keywords` 建 GIN 索引。
 
+示例索引定义（可按实际维度和距离函数调整）：
+
+```sql
+-- pgvector 索引示例（采用余弦距离）
+CREATE INDEX IF NOT EXISTS idx_memory_nodes_embedding_cosine
+ON memory_nodes
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
+-- keywords GIN 索引示例
+CREATE INDEX IF NOT EXISTS idx_memory_nodes_keywords
+ON memory_nodes
+USING GIN (keywords);
+```
+
 ### 2.2 向量写入与更新
 
 - 记忆节点写入时，需在应用或 Dify 工作流中对 `description` 做一次 embedding，并写入 `memory_nodes.embedding`。
@@ -123,6 +138,39 @@ DO UPDATE SET strength = kw_strength.strength + 1;
 ```
 
 > 这样就可以在 Dify 中复现原项目里 `kw_strength_event / kw_strength_thought` 的统计逻辑，用于反思触发或统计分析。
+
+此外，可以考虑在写入阶段对 `description` 做一次轻量预处理，使 embedding 更贴近原项目的 `embedding_key` 语义。例如，对于包含括号的描述：
+
+```text
+"Eddy is idle (at Aria's apartment)"
+```
+
+原项目会更关注括号中的位置信息。可以采用类似规则：
+
+```python
+def get_embedding_text(description: str) -> str:
+    if "(" in description and ")" in description:
+        try:
+            return description.split("(", 1)[1].split(")", 1)[0].strip()
+        except Exception:
+            return description
+    return description
+```
+
+在生成 embedding 时优先使用 `get_embedding_text(description)` 的结果。
+
+对于 `chat` 类型的记忆，建议使用结构化的方式存入 `filling` 字段，便于后续检索和重构上下文，例如：
+
+```json
+{
+  "conversation": [
+    ["Speaker1", "Hello"],
+    ["Speaker2", "Hi there"]
+  ]
+}
+```
+
+这样既保留了原始对话，更方便在 Dify 中进行重放或摘要。
 
 ---
 
