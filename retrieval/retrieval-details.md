@@ -94,6 +94,7 @@
 
 - `perceive` 会将当前看到的新事件写入记忆流（调用 `add_event` 等），并返回一组新感知事件的 `ConceptNode` 列表。
 - `retrieve` 只关注**刚感知到的这些事件**，为每个事件拉取与之相关的历史事件和想法。
+- `plan` 内部会进一步根据检索结果决定是否与他人对话、等待或不反应，本节聚焦在检索本身。
 
 ### 2.2 `retrieve(persona, perceived)` 的逻辑
 
@@ -216,14 +217,15 @@ nodes = sorted(nodes, key=lambda x: x[0])
 nodes = [i for created, i in nodes]
 ```
 
-> 这里的“时间顺序”是按最近访问时间而非创建时间，体现“用过的记忆会变得更近”的设计。
+> 这里的“时间顺序”是按最近访问时间而非创建时间，体现“用过的记忆会变得更近”的设计。  
+> 注意：后续的新近度得分**并不直接使用时间差**，而是对这个排序后的列表按位置应用指数衰减（第 1 个是 `decay^1`，第 2 个是 `decay^2`，依此类推），因此相邻节点间的得分差是固定的，与它们之间真实时间间隔长短无关。
 
 ### 3.3 三种原始评分
 
 对候选节点 `nodes` 计算三种分数：**Recency / Importance / Relevance**。
 
 1. **Recency（新近性）**：`extract_recency(persona, nodes)`
-   - 生成一个衰减序列：
+   - 生成一个衰减序列（基于节点在排序列表中的位置，而不是绝对时间差）：
 
    ```python
    recency_vals = [persona.scratch.recency_decay ** i
@@ -267,6 +269,19 @@ gw = [0.5, 3, 2]  # [recency, relevance, importance]
 - `recency_w`
 - `relevance_w`
 - `importance_w`
+
+当前默认值（见 `scratch.py`）为：
+
+- `recency_w = 1.0`
+- `relevance_w = 1.0`
+- `importance_w = 1.0`
+- `recency_decay = 0.99`
+
+因此在默认配置下，三种成分的有效权重约为：
+
+- 新近度：`1.0 * 0.5 = 0.5`
+- 相关性：`1.0 * 3   = 3.0`
+- 重要性：`1.0 * 2   = 2.0`
 
 4. **最终得分**：
 
