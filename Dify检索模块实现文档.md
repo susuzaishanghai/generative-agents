@@ -101,6 +101,28 @@
 
 - 记忆节点写入时，需在应用或 Dify 工作流中对 `description` 做一次 embedding，并写入 `memory_nodes.embedding`。
 - 当某条记忆被检索后，需要更新其 `last_accessed = now()`，以保留“使用过的记忆会更近”的语义。
+- 如果未来要实现类似原项目中“关键词强度统计 + 反思触发”机制，建议增加一张 `kw_strength` 统计表：
+
+```sql
+CREATE TABLE IF NOT EXISTS kw_strength (
+  persona_name VARCHAR NOT NULL,
+  keyword      VARCHAR NOT NULL,
+  memory_type  VARCHAR NOT NULL, -- 'event' or 'thought'
+  strength     INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (persona_name, keyword, memory_type)
+);
+```
+
+写入记忆时同步更新该表：
+
+```sql
+INSERT INTO kw_strength (persona_name, keyword, memory_type, strength)
+VALUES (:persona_name, :keyword, :type, 1)
+ON CONFLICT (persona_name, keyword, memory_type)
+DO UPDATE SET strength = kw_strength.strength + 1;
+```
+
+> 这样就可以在 Dify 中复现原项目里 `kw_strength_event / kw_strength_thought` 的统计逻辑，用于反思触发或统计分析。
 
 ---
 
@@ -391,6 +413,11 @@ WHERE id = ANY(:id_array::uuid[]);
   - 只更新前若干条（例如 top 10）
   - 或把更新操作放到单独的异步工作流里，由事件驱动执行。
 
+> 并发注意：在多 persona / 多实例并发检索同一条记忆的场景下，`last_accessed` 更新会存在竞态。生产环境中可以考虑：
+> - 在读取后更新前对行加锁：`SELECT ... FOR UPDATE`；
+> - 增加乐观锁字段（如 `version`），更新时带上版本号；
+> - 或降低更新频率（例如只每 N 次检索更新一次）。
+
 ### 4.6 步骤 5：输出给上游 LLM / 应用
 
 最终在工作流的 End / Response 节点中输出：
@@ -448,5 +475,18 @@ WHERE id = ANY(:id_array::uuid[]);
 - **权重调参**：
   - 可以在 Dify 的变量中暴露 `recency_w / relevance_w / importance_w / recency_decay`，允许在不同应用、不同 persona 间做个性化调节。
 
-通过上述设计，你就可以在 Dify 中较完整地复现 Generative Agents 中的记忆检索逻辑，并且保留了进一步调参、扩展 `retrieve()` 关键词检索和性能优化的空间。 
+- **并发控制**：
+  - 原项目在单进程内存中运行，不涉及数据库层面的并发问题。
+  - 在 Dify + PostgreSQL 架构下，需要注意：
+    - 记忆写入时的 `node_count` / `type_count` 自增可以用 SEQUENCE 或数据库自动生成列替代；
+    - `last_accessed` 更新的并发控制（见 4.5 节的建议）；
+    - 如果在工具或 Code 节点中调用外部 embedding 服务，需要确认客户端是线程安全的（或在工作流中串行使用）。
 
+### 6.6 生产环境部署建议
+
+- 使用连接池管理数据库连接（例如 pgBouncer / 应用层连接池），避免每个请求新建连接。
+- 对 embedding 模型调用增加熔断和降级机制（例如超时返回默认 embedding 或跳过该记忆）。
+- 监控 `last_accessed` 更新频率，必要时将更新操作异步化，以减轻主检索路径的压力。
+- 根据业务需求定期备份 `memory_nodes` 和相关统计表（如 `kw_strength`），并考虑归档历史记忆（冷数据分表或归档库）。
+
+通过上述设计，你就可以在 Dify 中较完整地复现 Generative Agents 中的记忆检索逻辑，并且保留了进一步调参、扩展 `retrieve()` 关键词检索和性能优化的空间。 
