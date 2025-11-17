@@ -27,20 +27,20 @@
     - `status`：`ok` / `no_candidates` / `error`
     - `debug`：调试信息（候选数、得分范围等）
 
-### 1.2 概念映射（原项目 → Dify）
+### 1.2 概念映射（原项目 → Dify，一人一库）
 
 - `AssociativeMemory.seq_event + seq_thought`  
-  → PostgreSQL 表 `memory_nodes` 中 `type in ('event','thought')` 的记录
+  → 每个 persona 自己的 PostgreSQL 库（例如 `ga_isabella`）中的 `associative_nodes` 表里，`type in ('event','thought')` 的记录
 - `embedding_key` + `embeddings.json`  
-  → `memory_nodes.embedding` 向量列（pgvector），`description` 直接作为 embedding 的文本来源
+  → `associative_nodes.embedding` 向量列（pgvector），`description` / `embedding_key` 作为 embedding 的文本来源
 - `last_accessed`  
-  → `memory_nodes.last_accessed` 时间戳列
+  → `associative_nodes.last_accessed` 时间戳列（可选，初始可使用 `created_at` 代替）
 - `poignancy`  
-  → `memory_nodes.poignancy` 数值列
+  → `associative_nodes.poignancy` 数值列
 - `subject / predicate / object / keywords`  
-  → `memory_nodes.subject / predicate / object / keywords`，用于后续实现 `retrieve()` 的关键词检索
+  → `associative_nodes.subject / predicate / object / keywords`，用于后续实现 `retrieve()` 的关键词检索
 - `filling`  
-  → `memory_nodes.filling`（JSONB，用于保存证据节点 ID 等）
+  → `associative_nodes.filling`（JSONB，用于保存证据节点 ID 等）
 - `new_retrieve(persona, focal_points, n)`  
   → Dify 工作流 `Memory Retrieval`，一轮检索处理一个 `focal_text`，在 Code 节点中实现三因子加权打分。
 
@@ -71,17 +71,19 @@
 
 ## 2. 数据层准备（PostgreSQL）
 
-### 2.1 核心表：`memory_nodes`
+### 2.1 核心表：`associative_nodes`（一人一库）
 
-参考 `check_database_structure.sql` 与原项目，建议 `memory_nodes` 至少包含如下字段：
+参考 `check_database_structure.sql` 与原项目，每个 persona 单独一个库（例如 `ga_isabella`），库中包含一张长期记忆表 `associative_nodes`，建议至少包含如下字段：
 
 - 基础字段（本篇检索实现必需）：
   - `id`：主键（UUID 或自增 ID）
-  - `persona_name`：所属 Agent 名
+  - `node_count`：全局计数，用于保持与原项目一致的节点顺序
+  - `type_count`：类型内计数（事件计数 / 思想计数 / 对话计数）
   - `type`：`event` / `thought` / `chat`
   - `created_at`：创建时间
-  - `last_accessed`：最近一次被检索或访问的时间
-  - `description`：自然语言描述（对应原项目的 `embedding_key`）
+  - `last_accessed`：最近一次被检索或访问的时间（初期可选，缺省时可在检索中用 `created_at` 近似）
+  - `description`：自然语言描述（通常是 clean_description）
+  - `embedding_key`：用于生成 embedding 的文本 key（通常是 full_description 或括号内短语）
   - `poignancy`：重要性评分（整数或浮点）
   - `embedding`：`vector` 类型列，保存文本向量（例如 bge-m3，维度 768/1024 等）
 
@@ -94,21 +96,21 @@
 推荐索引：
 
 - `embedding` 上的 pgvector 索引（便于后续向量粗排）
-- `(persona_name, type)` 普通索引（便于按角色 + 类型过滤）
+- `(type)` 普通索引（便于按类型过滤）
 - 如果要支持 `retrieve()` 的关键词检索，可对 `keywords` 建 GIN 索引。
 
 示例索引定义（可按实际维度和距离函数调整）：
 
 ```sql
 -- pgvector 索引示例（采用余弦距离）
-CREATE INDEX IF NOT EXISTS idx_memory_nodes_embedding_cosine
-ON memory_nodes
+CREATE INDEX IF NOT EXISTS idx_associative_nodes_embedding_cosine
+ON associative_nodes
 USING ivfflat (embedding vector_cosine_ops)
 WITH (lists = 100);
 
 -- keywords GIN 索引示例
-CREATE INDEX IF NOT EXISTS idx_memory_nodes_keywords
-ON memory_nodes
+CREATE INDEX IF NOT EXISTS idx_associative_nodes_keywords
+ON associative_nodes
 USING GIN (keywords);
 ```
 
@@ -139,7 +141,7 @@ DO UPDATE SET strength = kw_strength.strength + 1;
 
 > 这样就可以在 Dify 中复现原项目里 `kw_strength_event / kw_strength_thought` 的统计逻辑，用于反思触发或统计分析。
 
-此外，可以考虑在写入阶段对 `description` 做一次轻量预处理，使 embedding 更贴近原项目的 `embedding_key` 语义。例如，对于包含括号的描述：
+此外，可以考虑在写入阶段对 `description` / `embedding_key` 做一次轻量预处理，使 embedding 更贴近原项目的 `embedding_key` 语义。例如，对于包含括号的描述：
 
 ```text
 "Eddy is idle (at Aria's apartment)"
@@ -193,7 +195,7 @@ def get_embedding_text(description: str) -> str:
 
 在检索工作流中，通常会用到：
 
-- `crud/select` 或 `execute_sql_simple`：拉取候选记忆节点
+- `crud/select` 或 `execute_sql_simple`：拉取候选记忆节点（来自当前 persona 的 `ga_{{persona_db}}.associative_nodes`）
 - `crud/update` 或 `execute_sql_simple`：更新 `last_accessed`（推荐）
 
 ---
@@ -204,15 +206,16 @@ def get_embedding_text(description: str) -> str:
 
 在 Start 节点定义输入：
 
-| 变量名          | 类型    | 说明                         | 默认值 |
-|-----------------|---------|------------------------------|--------|
-| `persona_name`  | String  | 当前检索的 Agent 名称        | -      |
-| `focal_text`    | String  | 检索焦点描述                 | -      |
-| `top_k`         | Number  | 需要返回的记忆条数           | 30     |
-| `recency_w`     | Number  | 新近度权重（乘 gw[0]）       | 1.0    |
-| `relevance_w`   | Number  | 相关性权重（乘 gw[1]）       | 1.0    |
-| `importance_w`  | Number  | 重要性权重（乘 gw[2]）       | 1.0    |
-| `recency_decay` | Number  | 新近度衰减系数               | 0.99   |
+| 变量名          | 类型    | 说明                                   | 默认值 |
+|-----------------|---------|----------------------------------------|--------|
+| `persona_name`  | String  | 当前检索的 Agent 名称（用于上游展示）  | -      |
+| `persona_db`    | String  | 当前 persona 对应的数据库后缀（如 isabella） | - |
+| `focal_text`    | String  | 检索焦点描述                           | -      |
+| `top_k`         | Number  | 需要返回的记忆条数                     | 30     |
+| `recency_w`     | Number  | 新近度权重（乘 gw[0]）                 | 1.0    |
+| `relevance_w`   | Number  | 相关性权重（乘 gw[1]）                 | 1.0    |
+| `importance_w`  | Number  | 重要性权重（乘 gw[2]）                 | 1.0    |
+| `recency_decay` | Number  | 新近度衰减系数                         | 0.99   |
 
 > 实际有效权重 = `scratch` 权重 × 全局增益 `gw`。默认情况下：
 > - recency：`1.0 × 0.5 = 0.5`
@@ -232,23 +235,23 @@ def get_embedding_text(description: str) -> str:
 - **节点类型**：API 工具节点（调用 `executeSqlSimple` 或 `crudSelect`）
 - **节点作用**：按 persona 过滤，取 `event` + `thought` 类型的记忆作为候选集。
 
-基础查询示例（伪 SQL，实际根据工具入参格式调整）：
+基础查询示例（伪 SQL，实际根据工具入参格式调整，注意 DSN 指向当前 persona 的库，例如 `ga_{{persona_db}}`）：
 
 ```sql
 SELECT
   id,
-  persona_name,
+  node_count,
+  type_count,
   type,
   created_at,
   last_accessed,
   description,
   poignancy,
   embedding
-FROM memory_nodes
-WHERE persona_name = :persona_name
-  AND type IN ('event', 'thought')
+FROM associative_nodes
+WHERE type IN ('event', 'thought')
   AND embedding IS NOT NULL
-ORDER BY last_accessed ASC;
+ORDER BY COALESCE(last_accessed, created_at) ASC;
 ```
 
 > 说明：原项目在 Python 里用 `"idle" not in i.embedding_key` 过滤“空闲事件”。在 Dify 侧可以有三种实现方式（任选其一）：  
@@ -445,10 +448,10 @@ def main(arg):
 - **输入**：上一节点输出的 `accessed_ids` 数组
 - **行为示例**：
 
-SQL 示例（使用 `ANY` 批量更新）：
+SQL 示例（使用 `ANY` 批量更新，针对当前 persona 的 `ga_{{persona_db}}.associative_nodes`）：
 
 ```sql
-UPDATE memory_nodes
+UPDATE associative_nodes
 SET last_accessed = now()
 WHERE id = ANY(:id_array::uuid[]);
 ```
@@ -535,6 +538,6 @@ WHERE id = ANY(:id_array::uuid[]);
 - 使用连接池管理数据库连接（例如 pgBouncer / 应用层连接池），避免每个请求新建连接。
 - 对 embedding 模型调用增加熔断和降级机制（例如超时返回默认 embedding 或跳过该记忆）。
 - 监控 `last_accessed` 更新频率，必要时将更新操作异步化，以减轻主检索路径的压力。
-- 根据业务需求定期备份 `memory_nodes` 和相关统计表（如 `kw_strength`），并考虑归档历史记忆（冷数据分表或归档库）。
+- 根据业务需求定期备份各 persona 库中的 `associative_nodes` 和相关统计表（如 `kw_strength`），并考虑归档历史记忆（冷数据分库或归档库）。
 
 通过上述设计，你就可以在 Dify 中较完整地复现 Generative Agents 中的记忆检索逻辑，并且保留了进一步调参、扩展 `retrieve()` 关键词检索和性能优化的空间。 
