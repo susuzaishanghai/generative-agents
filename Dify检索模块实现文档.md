@@ -1,7 +1,7 @@
 # Dify 检索模块实现文档
 
 > 基于 Stanford Generative Agents 项目，在 Dify 平台上实现 Memory Retrieval（记忆检索）模块  
-> 目标：在不强行改动原有算法的前提下，用 Dify 工作流 + PostgreSQL 复现 `new_retrieve` 的核心行为。
+> 目标：在不强行改动原有算法的前提下，用 Dify 工作流 + PostgreSQL 复现 `new_retrieve` 的核心行为，并为后续 `retrieve()` 关键词检索预留扩展空间。
 
 ---
 
@@ -20,7 +20,7 @@
     - `created_at / last_accessed`
     - `description`
     - `poignancy`
-    - 其他需要透传给上游 LLM 的字段
+    - 其他用于规划 / 反思 / 对话的必要字段
 
 ### 1.2 概念映射（原项目 → Dify）
 
@@ -32,8 +32,35 @@
   → `memory_nodes.last_accessed` 时间戳列
 - `poignancy`  
   → `memory_nodes.poignancy` 数值列
+- `subject / predicate / object / keywords`  
+  → `memory_nodes.subject / predicate / object / keywords`，用于后续实现 `retrieve()` 的关键词检索
+- `filling`  
+  → `memory_nodes.filling`（JSONB，用于保存证据节点 ID 等）
 - `new_retrieve(persona, focal_points, n)`  
   → Dify 工作流 `Memory Retrieval`，一轮检索处理一个 `focal_text`，通过 Code 节点实现加权打分。
+
+### 1.3 完整字段映射表
+
+| 原项目字段      | Dify/PostgreSQL 字段 | 类型            | 说明                         |
+|-----------------|----------------------|-----------------|------------------------------|
+| `node_id`       | `id`                 | UUID / VARCHAR  | 主键                         |
+| `type`          | `type`               | VARCHAR         | `event` / `thought` / `chat` |
+| `created`       | `created_at`         | TIMESTAMP       | 创建时间                     |
+| `last_accessed` | `last_accessed`      | TIMESTAMP       | 最近访问时间                 |
+| `description`   | `description`        | TEXT            | 自然语言描述                 |
+| `embedding_key` | —                    | —               | 直接用 `description` 作为 key |
+| embeddings.json | `embedding`          | `vector`        | pgvector 向量                |
+| `poignancy`     | `poignancy`          | FLOAT           | 重要性分数                   |
+| `subject`       | `subject`            | VARCHAR         | S/P/O 三元组                 |
+| `predicate`     | `predicate`          | VARCHAR         | S/P/O 三元组                 |
+| `object`        | `object`             | VARCHAR         | S/P/O 三元组                 |
+| `keywords`      | `keywords`           | TEXT[]          | 关键词数组                   |
+| `filling`       | `filling`            | JSONB           | 补充信息 / 证据              |
+| `node_count`    | `node_count`         | INTEGER         | 全局计数                     |
+| `type_count`    | `type_count`         | INTEGER         | 类型内计数                   |
+| `depth`         | `depth`              | INTEGER         | 思考深度                     |
+
+> 说明：本篇文档的检索实现主要使用 `type / description / embedding / last_accessed / poignancy`，但表结构上建议一次性补齐这些字段，方便后续扩展基于关键词的 `retrieve()` 和更丰富的分析能力。
 
 ---
 
@@ -41,21 +68,29 @@
 
 ### 2.1 核心表：`memory_nodes`
 
-参考 `check_database_structure.sql` 与现有实现，确保存在如下字段（字段名可以略有不同，但含义要一致）：
+参考 `check_database_structure.sql` 与原项目，建议 `memory_nodes` 至少包含如下字段：
 
-- `id`：主键（UUID 或自增 ID）
-- `persona_name`：所属 Agent 名
-- `type`：`event` / `thought` / `chat`（检索时主要用前两类）
-- `created_at`：创建时间
-- `last_accessed`：最近一次被检索或访问的时间
-- `description`：自然语言描述（对应 `embedding_key`）
-- `poignancy`：重要性评分（整数或浮点）
-- `embedding`：`vector` 类型列，保存文本向量（例如 bge-m3，维度 1024 / 768 / 512 等）
+- 基础字段（本篇检索实现必需）：
+  - `id`：主键（UUID 或自增 ID）
+  - `persona_name`：所属 Agent 名
+  - `type`：`event` / `thought` / `chat`
+  - `created_at`：创建时间
+  - `last_accessed`：最近一次被检索或访问的时间
+  - `description`：自然语言描述（对应原项目的 `embedding_key`）
+  - `poignancy`：重要性评分（整数或浮点）
+  - `embedding`：`vector` 类型列，保存文本向量（例如 bge-m3，维度 768/1024 等）
 
-推荐建立：
+- 扩展字段（为 `retrieve()` 和调试预留）：
+  - `subject` / `predicate` / `object`：S/P/O 三元组
+  - `keywords`：TEXT[]，保存拆分后的关键词（例如从 S/P/O + description 中提取）
+  - `filling`：JSONB，用于保存证据节点 ID 列表等结构化信息
+  - `node_count` / `type_count` / `depth`：可选，用于复原原项目的统计信息与思考深度
 
-- `embedding` 上的 pgvector 索引（方便将来用向量检索加速）
+推荐索引：
+
+- `embedding` 上的 pgvector 索引（便于后续向量粗排）
 - `(persona_name, type)` 普通索引（便于按角色+类型过滤）
+- 如果要支持 `retrieve()` 的关键词检索，可对 `keywords` 建 GIN 索引。
 
 ### 2.2 向量写入与更新
 
@@ -113,7 +148,7 @@
 - **节点类型**：API 工具节点（调用 `executeSqlSimple` 或 `crudSelect`）
 - **节点作用**：按 persona 过滤，取 `event` + `thought` 类型的记忆作为候选集。
 
-示例（伪 SQL，实际根据工具入参格式调整）：
+基础查询示例（伪 SQL，实际根据工具入参格式调整）：
 
 ```sql
 SELECT
@@ -129,11 +164,29 @@ FROM memory_nodes
 WHERE persona_name = :persona_name
   AND type IN ('event', 'thought')
   AND embedding IS NOT NULL
-  AND (description NOT ILIKE '%idle%')
 ORDER BY last_accessed ASC;
 ```
 
-工具输出中，应至少包含字段：`id, type, last_accessed, description, poignancy, embedding`。
+> 说明：原项目在 Python 里用 `"idle" not in i.embedding_key` 过滤“空闲事件”。在 Dify 侧可以有三种实现方式（任选其一）：  
+> - 在表中增加 `is_idle BOOLEAN` 字段，在 SQL 中 `AND is_idle = FALSE`；  
+> - 如果有 `keywords` 字段，可 `AND NOT (keywords && ARRAY['idle'])`；  
+> - 保持 SQL 简单，在 Code 节点中用 `if "idle" not in description.lower()` 做过滤（最易实现）。
+
+**性能优化选项**（可按数据量选择是否开启）：
+
+- 限制时间范围，例如只看最近 7 天的记忆：
+
+```sql
+AND created_at > now() - interval '7 days'
+```
+
+- 使用 pgvector 做一次粗排，只取相似度最高的前 N 条再进 Code 精排：
+
+```sql
+WHERE persona_name = :persona_name
+ORDER BY embedding <=> :focal_embedding
+LIMIT 100;
+```
 
 ### 4.4 步骤 3：在 Code 节点里计算三维评分并排序
 
@@ -143,109 +196,160 @@ ORDER BY last_accessed ASC;
   - `focal_embedding`：焦点向量
   - 可选超参数：`recency_decay, recency_w, relevance_w, importance_w, top_k`
 
-代码核心逻辑（简化版伪代码）：
+核心代码示例（与原 `new_retrieve` 等价的三因子打分）：
 
 ```python
 import math
-from typing import List, Dict
+from typing import List, Dict, Any
 
-def cos_sim(a, b):
-    dot = sum(x*y for x, y in zip(a, b))
-    na = math.sqrt(sum(x*x for x in a))
-    nb = math.sqrt(sum(x*x for x in b))
-    if na == 0 or nb == 0:
+def cos_sim(a: List[float], b: List[float]) -> float:
+    """计算余弦相似度，处理维度不一致 / 空向量边界情况。"""
+    if not a or not b or len(a) != len(b):
         return 0.0
+
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+
+    if na < 1e-8 or nb < 1e-8:
+        return 0.0
+
     return dot / (na * nb)
 
-def normalize(d: Dict[str, float]) -> Dict[str, float]:
+def normalize(d: Dict[str, float], target_min: float = 0.0, target_max: float = 1.0) -> Dict[str, float]:
+    """归一化到指定范围 [target_min, target_max]，与原项目 normalize_dict_floats 逻辑一致。"""
     if not d:
         return {}
+
     vals = list(d.values())
     vmin, vmax = min(vals), max(vals)
-    if vmax == vmin:
-        return {k: 0.5 for k in d.keys()}
-    return {k: (v - vmin) / (vmax - vmin) for k, v in d.items()}
+    range_val = vmax - vmin
+
+    if range_val == 0:
+        mid = (target_max - target_min) / 2.0
+        return {k: mid for k in d.keys()}
+
+    return {
+        k: ((v - vmin) * (target_max - target_min) / range_val + target_min)
+        for k, v in d.items()
+    }
+
+def ensure_list_float(v: Any) -> List[float]:
+    """将数据库返回的 embedding 转为 List[float]，并处理 None / 非列表情况。"""
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [float(x) for x in v]
+    # 如果是字符串（例如 '[0.1, 0.2, ...]'），可在这里加 json.loads 解析
+    return []
 
 def main(arg):
     rows = arg["db_rows"]          # 来自 SQL 节点
-    focal_emb = arg["focal_embedding"]
-    recency_decay = arg.get("recency_decay", 0.99)
-    recency_w = arg.get("recency_w", 1.0)
-    relevance_w = arg.get("relevance_w", 1.0)
-    importance_w = arg.get("importance_w", 1.0)
+    focal_emb = ensure_list_float(arg["focal_embedding"])
+
+    recency_decay = float(arg.get("recency_decay", 0.99))
+    recency_w = float(arg.get("recency_w", 1.0))
+    relevance_w = float(arg.get("relevance_w", 1.0))
+    importance_w = float(arg.get("importance_w", 1.0))
     gw = [0.5, 3.0, 2.0]           # 与原项目一致
     top_k = int(arg.get("top_k", 30))
+
+    # 可选：在这里过滤 idle 相关描述
+    filtered_rows = []
+    for r in rows:
+        desc = (r.get("description") or "").lower()
+        if "idle" in desc:
+            continue
+        filtered_rows.append(r)
+    rows = filtered_rows
+
+    if not rows or not focal_emb:
+        return {"retrieved_nodes": [], "accessed_ids": []}
 
     # 1) 构造 ID 列表，保证顺序与 last_accessed 排序一致
     node_ids = [str(r["id"]) for r in rows]
 
-    # 2) Recency：按位置指数衰减
+    # 2) Recency：按位置指数衰减（与原 extract_recency 一致）
     recency_vals = [recency_decay ** i for i in range(1, len(node_ids) + 1)]
     recency_out = {node_ids[i]: recency_vals[i] for i in range(len(node_ids))}
 
     # 3) Importance：直接用 poignancy
-    importance_out = {str(r["id"]): float(r.get("poignancy", 0.0)) for r in rows}
+    importance_out = {
+        str(r["id"]): float(r.get("poignancy", 0.0)) for r in rows
+    }
 
     # 4) Relevance：embedding 余弦相似度
     relevance_out = {}
     for r in rows:
         nid = str(r["id"])
-        emb = r["embedding"]       # 确保转换成 List[float]
+        emb = ensure_list_float(r.get("embedding"))
         relevance_out[nid] = cos_sim(emb, focal_emb)
 
     # 5) 归一化到 [0,1]
-    recency_n = normalize(recency_out)
-    importance_n = normalize(importance_out)
-    relevance_n = normalize(relevance_out)
+    recency_n = normalize(recency_out, 0.0, 1.0)
+    importance_n = normalize(importance_out, 0.0, 1.0)
+    relevance_n = normalize(relevance_out, 0.0, 1.0)
 
     # 6) 加权合成最终得分
     master = {}
     for nid in node_ids:
         master[nid] = (
-            recency_w   * recency_n[nid]   * gw[0] +
-            relevance_w * relevance_n[nid] * gw[1] +
-            importance_w* importance_n[nid]* gw[2]
+            recency_w   * recency_n.get(nid, 0.0)   * gw[0] +
+            relevance_w * relevance_n.get(nid, 0.0) * gw[1] +
+            importance_w* importance_n.get(nid, 0.0)* gw[2]
         )
 
     # 7) 排序取 Top-K
     sorted_ids = sorted(master.keys(), key=lambda x: master[x], reverse=True)
     sorted_ids = sorted_ids[:top_k]
 
-    # 8) 组装输出（带上原始行 + 得分）
+    # 8) 组装输出（带上原始行 + 得分，并收集需要更新 last_accessed 的 ID）
     id_to_row = {str(r["id"]): r for r in rows}
     result = []
+    accessed_ids = []
     for nid in sorted_ids:
         row = dict(id_to_row[nid])
         row["score"] = master[nid]
         result.append(row)
+        accessed_ids.append(nid)
 
-    return {"retrieved_nodes": result}
+    return {
+        "retrieved_nodes": result,
+        "accessed_ids": accessed_ids
+    }
 ```
 
-> 这段代码是对原 `new_retrieve` 中 `extract_recency / extract_importance / extract_relevance` + 加权部分的等价翻译，放在 Dify 的 Code 节点即可。
+> 上面的 `cos_sim / normalize` 与原项目 `cos_sim / normalize_dict_floats` 的逻辑保持一致，并额外处理了维度不一致、向量为空等边界情况。
 
-### 4.5 步骤 4：更新 `last_accessed`（可选）
+### 4.5 步骤 4：更新 `last_accessed`（推荐）
 
 如果希望保留“被检索的记忆会变新”的行为，可以增加一个工具节点：
 
-- **节点类型**：API 工具节点（`crudUpdate` 或执行 `UPDATE`）
-- **输入**：上一节点输出的 `retrieved_nodes` 中的 `id` 列表
-- **行为**：
+- **节点类型**：API 工具节点（`executeSqlSimple` / `crudUpdate`）
+- **输入**：上一节点输出的 `accessed_ids` 数组
+- **行为示例**：
+
+SQL 示例（使用 `ANY` 批量更新）：
 
 ```sql
 UPDATE memory_nodes
 SET last_accessed = now()
-WHERE id = ANY(:id_array);
+WHERE id = ANY(:id_array::uuid[]);
 ```
 
-在 Dify 中，可以将 `id` 列表序列化成 JSON 数组，作为工具参数传入。
+在 Dify 中：
+
+- 将 Code 节点输出的 `accessed_ids` 作为 JSON 数组传给工具节点参数，比如 `{"id_array": {{code_node.accessed_ids}}}`。
+- 如果担心更新压力，可以：
+  - 只更新前若干条（例如 top 10）
+  - 或把更新操作放到单独的异步工作流里，由事件驱动执行。
 
 ### 4.6 步骤 5：输出给上游 LLM / 应用
 
 最终在工作流的 End / Response 节点中输出：
 
 - `retrieved_nodes`：按分数排序的记忆列表
-- 可选：仅输出 `description` 拼接成上下文，供 Planner LLM 使用
+- 可选：仅输出 `description` 拼接成上下文，供 Planner / Reflect LLM 使用
 
 ---
 
@@ -264,9 +368,9 @@ WHERE id = ANY(:id_array);
    - 输出：`db_rows`
 4. **Code 节点：`计算检索得分并排序`**
    - 输入：`db_rows`, `focal_embedding`, 以及超参数
-   - 输出：`retrieved_nodes`
-5. **PostgreSQL 工具节点（可选）：`更新_last_accessed`**
-   - 根据 `retrieved_nodes.id` 列表执行 `UPDATE`
+   - 输出：`retrieved_nodes`, `accessed_ids`
+5. **PostgreSQL 工具节点（推荐）：`更新_last_accessed`**
+   - 根据 `accessed_ids` 执行 `UPDATE`
 6. **结束节点（End / Response）**
    - 返回 `retrieved_nodes` 或格式化后的上下文字符串
 
@@ -275,14 +379,23 @@ WHERE id = ANY(:id_array);
 ## 6. 与原项目的差异与注意事项
 
 - **多 focal_points 支持**：
-  - 原项目 `new_retrieve` 支持同时对多个 `focal_points` 检索，这里示例以“一个工作流处理一个 focal_text”为主。
+  - 原项目 `new_retrieve` 支持同时对多个 `focal_points` 检索，这里示例以“一个工作流处理一个 `focal_text`”为主。
   - 如果需要，可以在 Start 节点传入一个 JSON 数组，在 Code 节点内循环处理，每个 focal 返回一组节点。
-- **embedding 模型不同**：
-  - 原项目使用 OpenAI `text-embedding-ada-002`，当前实现使用 bge-m3，只要读取/写入使用的都是同一模型，算法本身不受影响。
+
+- **embedding 模型差异**：
+  - 原项目使用 OpenAI `text-embedding-ada-002`，当前实现使用 bge-m3，只要读写时使用的都是同一模型，算法本身不受影响。
+
+- **错误处理与数据质量**：
+  - 原项目中，如果节点没有 embedding，会在写入时补全；在 Dify 实现中，建议在写入记忆时就确保 `embedding` 不为空。
+  - 在 Code 节点中，如果 `embedding` 为 `None` 或维度与 `focal_embedding` 不一致，`cos_sim` 会返回 0，避免抛异常。
+  - 如果 PostgreSQL 驱动返回的 `embedding` 是字符串（如 `'[0.1, 0.2, ...]'`），需要在 `ensure_list_float` 中增加 `json.loads` 解析逻辑。
+
+- **性能优化**：
+  - 对于记忆量较大（几十万条以上）的场景，应优先在 SQL 层做预过滤（时间范围 / 向量粗排），再在 Code 节点做精排。
+  - 可以对热 persona 做缓存，避免每次都从数据库拉全量候选。
+
 - **权重调参**：
   - 可以在 Dify 的变量中暴露 `recency_w / relevance_w / importance_w / recency_decay`，允许在不同应用、不同 persona 间做个性化调节。
-- **性能优化**：
-  - 如果记忆量很大，可以在 SQL 层先做一次粗筛（例如只取最近 N 条，或先做向量相似度 top-k），再在 Code 节点做精排。
 
-通过上述设计，你就可以在 Dify 中较完整地复现 Generative Agents 中的记忆检索逻辑，并且保留了进一步调参和扩展的空间。 
+通过上述设计，你就可以在 Dify 中较完整地复现 Generative Agents 中的记忆检索逻辑，并且保留了进一步调参、扩展 `retrieve()` 关键词检索和性能优化的空间。 
 
